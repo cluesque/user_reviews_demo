@@ -6,30 +6,23 @@ class UserReviewTest < ActiveSupport::TestCase
     @book = Book.create!(:title => 'Snow Crash')
     @movie = Movie.create!(:title => 'Jaws')
   end
-  def test_user_review_activerecord_check
-    
-    book_review = UserReview.new(:user => @user, :book => @book)
-    assert book_review.save
-
-    movie_review = UserReview.new(:user => @user, :movie => @movie)
-    assert movie_review.save
-
-    duplicate_review = UserReview.new(:user => @user, :movie => @movie)
-    assert !duplicate_review.save # No, cannot save that
-  end
-
-  def test_user_review_database_check
-    book_review = UserReview.create(:user => @user, :book => @book)
-    assert book_review.save
-
-    movie_review = UserReview.create(:user => @user, :movie => @movie)
-    assert movie_review.save
-
-    assert_raise ActiveRecord::RecordNotUnique do
-      UserReview.connection.execute <<-EOSQL
-      INSERT INTO user_reviews (user_id, book_id)
-        VALUES (#{@user.id}, #{@book.id})
-      EOSQL
+  context 'with movie and book reviews' do
+    setup do
+      UserReview.create!(:user => @user, :book => @book)
+      UserReview.create!(:user => @user, :movie => @movie)
+    end
+    should_change("review count", :by => 2){ UserReview.count }
+    should 'prevent saving with activerecord' do
+      duplicate_review = UserReview.new(:user => @user, :movie => @movie)
+      assert !duplicate_review.save
+    end
+    should 'prevent saving with SQL' do
+      assert_raise ActiveRecord::RecordNotUnique do
+        UserReview.connection.execute <<-EOSQL
+        INSERT INTO user_reviews (user_id, book_id)
+          VALUES (#{@user.id}, #{@book.id})
+        EOSQL
+      end
     end
   end
 end

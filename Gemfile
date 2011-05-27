@@ -30,3 +30,6 @@ gem 'foreigner'
 # group :development, :test do
 #   gem 'webrat'
 # end
+group :test do
+  gem 'shoulda'
+end
