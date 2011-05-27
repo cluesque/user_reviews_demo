@@ -1,0 +1,135 @@
+Uniqueness protection in postgres when some columns may be null.
+----------
+
+ActiveRecord uniqueness validation is nice, but you're always open to race conditions, where two application instances (mongrels, passengers, dynos, ...) process the same request at the same time.  They both look to see if there is a match, both see there is none, then both write identical copies of the record.
+
+After this, **Bad Things Happen**.  The race condition is glossed over when humans driving web browsers are the only clients, but get much more common when AJAX and automated API clients are involved.
+
+If you care about your data integrity, _you need to ensure it at the database level._
+
+Say you've got a postgres backed rails application where users write reviews.  You list movies and books, and any given review will be about a movie or a book.  (But not both.) 
+
+The models are User, Movie, Book, UserReview.  Details of User, Movie, Book aren't important for this discussion, here we're interested in the UserReview. (This toy app intentionally leaves out the useful parts, to highlight just the uniqueness constraint part.)
+
+Our UserReview model:
+--
+
+    class UserReview < ActiveRecord::Base
+      belongs_to :user
+      belongs_to :movie
+      belongs_to :book
+      validates_presence_of :user
+      validates_associated :user
+      validates_associated :book
+      validates_associated :movie
+      validate do |u|
+        u.errors.add :base, "Must belong to book or movie" if(u.book.nil? && u.movie.nil?)
+      end
+      validates_uniqueness_of :user_id, :scope => [:book_id, :movie_id]
+    end
+
+Migration creating the user reviews table:
+--
+    class CreateUserReviews < ActiveRecord::Migration
+      def self.up
+        create_table :user_reviews
+        change_table :user_reviews do |t|
+          t.references :user, :null => false
+          t.references :movie
+          t.references :book
+        end
+        # ActiveRecord handy unique constraint syntax sugar:
+        add_index :user_reviews, [:user_id, :book_id, :movie_id], :unique => true
+        # For bonus points, use the foreigner gem to pretty these up:
+        execute "ALTER TABLE user_reviews ADD CONSTRAINT user_reviews_user_id_fk FOREIGN KEY (user_id) REFERENCES books(id)"
+        execute "ALTER TABLE user_reviews ADD CONSTRAINT user_reviews_book_id_fk FOREIGN KEY (book_id) REFERENCES books(id)"
+        execute "ALTER TABLE user_reviews ADD CONSTRAINT user_reviews_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movies(id)"
+      end
+    
+      def self.down
+        drop_table :user_reviews
+      end
+    end
+
+All looks great, right?  We can even write a testcase demonstrating that ActiveRecord will prevent us from inserting a duplicated UserReview:
+
+    class UserReviewTest < ActiveSupport::TestCase
+      def setup
+        @user = User.create!(:login => 'bob')
+        @book = Book.create!(:title => 'Snow Crash')
+        @movie = Movie.create!(:title => 'Jaws')
+      end
+      def test_user_review_activerecord_check
+        
+        book_review = UserReview.new(:user => @user, :book => @book)
+        assert book_review.save
+    
+        movie_review = UserReview.new(:user => @user, :movie => @movie)
+        assert movie_review.save
+    
+        duplicate_review = UserReview.new(:user => @user, :movie => @movie)
+        assert !duplicate_review.save # No, cannot save that
+      end
+    end
+
+This demonstrates that ActiveRecord is doing its job and not attempting to save if it reads a duplicate from the database.  
+
+But we can't tell whether the database will protect us.  (Testing it with just ActiveRecord is hard, requiring a second process and delays and locks and _blech_.)
+
+Let's use SQL to test for that:
+
+
+      def test_user_review_database_check
+        book_review = UserReview.create(:user => @user, :book => @book)
+        assert book_review.save
+    
+        movie_review = UserReview.create(:user => @user, :movie => @movie)
+        assert movie_review.save
+    
+        assert_raise ActiveRecord::RecordNotUnique do
+          UserReview.connection.execute <<-EOSQL
+          INSERT INTO user_reviews (user_id, book_id)
+            VALUES (#{@user.id}, #{@book.id})
+          EOSQL
+        end
+      end
+
+Let's just test that, and ... OH NOES! ... the test still fails?  How could that be?  
+
+Let me [get my google on](http://www.google.com/search?hl=en&btnI=I%27m+Feeling+Lucky&pws=0&q=psql+create+unique+index+coalesce) ... lands us pretty quickly on [someone asking about this exact problem](http://archives.postgresql.org/pgsql-sql/2007-07/msg00156.php) on the postgresql mailing list, and [being shot down](http://archives.postgresql.org/pgsql-sql/2007-07/msg00162.php) with a bit of asshole pedantry:
+
+>> You appear to be hoping that a unique index would constrain a column to
+>> contain at most one null entry.  It doesn't work like that, and I
+>> strongly urge you to reconsider what you're using null for.  I think you
+>> are in for a world of hurt, well beyond this one particular point,
+>> because the SQL spec's semantics for null are not designed around the
+>> idea that it represents a single distinguishable value.  What it
+>> represents is "unknown".
+
+
+See, this is why we can't have nice things.  The guy asks a simple question with a valid problem.  And even presents the solution.
+
+OK, fine, so the "SQL spec semantics are not designed around the idea", but it's really quite common to use a null in a foreign key column to mean "I know that there is none".  So let's fix the problem rather than getting all lectury about theory, eh?
+
+The trick is to use the SQL COALESCE function to allow that: _no, really, I know that NULL means no record_.
+
+So let's go back and do the migration to generate the correct unique constraint:
+
+    class SafeUniqueConstraint < ActiveRecord::Migration
+      def self.up
+        execute <<-EOSQL
+          CREATE UNIQUE INDEX user_reviews_unique 
+              ON user_reviews (user_id, 
+                               COALESCE(movie_id, 0), 
+                               COALESCE(book_id, 0))
+        EOSQL
+      end
+    
+      def self.down
+        execute "DROP INDEX user_reviews_unique"
+      end
+    end
+
+... and now, yay, our test passes!
+
+Something I don't understand - is there ever a use case where you would want a nullable foreign key column to be part of a uniqueness constraint and *not* want this?  Perhaps the real problem is that the ActiveRecord constraint generator doesn't do this for me automatically, perhaps by reflecting on the fact the column is nullable?
