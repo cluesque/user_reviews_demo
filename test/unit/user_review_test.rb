@@ -2,9 +2,9 @@ require File.dirname(__FILE__) + '/../test_helper'
 
 class UserReviewTest < ActiveSupport::TestCase
   def setup
-    @user = User.create!(:login => 'bob')
-    @book = Book.create!(:title => 'Snow Crash')
-    @movie = Movie.create!(:title => 'Jaws')
+    @user = Factory(:user)
+    @book = Factory(:book)
+    @movie = Factory(:movie)
   end
   context 'with movie and book reviews' do
     setup do
